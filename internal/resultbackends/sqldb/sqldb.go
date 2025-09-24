@@ -219,21 +219,39 @@ func (w *SQLDBResultSet) WriteBatch(rows [][]interface{}) error {
 		return fmt.Errorf("column types for '%s' have not been registered", w.taskName)
 	}
 
-	// Determine column count from first row
-	colCount := len(rows[0])
+	// First, format the insertRow with the table name
+	formattedInsert := fmt.Sprintf(rSchema.insertRow, w.tbl)
 
-	// Check if PostgreSQL (uses numbered placeholders like $1, $2)
-	isPostgres := strings.Contains(rSchema.insertRow, "$")
-
-	// Find VALUES clause position
-	upperQuery := strings.ToUpper(rSchema.insertRow)
-	valuesIdx := strings.Index(upperQuery, "VALUES")
-	if valuesIdx == -1 {
-		return fmt.Errorf("cannot find VALUES in insert query")
+	// Find the last opening parenthesis which should be the VALUES clause
+	lastParen := strings.LastIndex(formattedInsert, "(")
+	if lastParen == -1 {
+		return fmt.Errorf("cannot find VALUES clause in insert query: %s", formattedInsert)
 	}
 
-	// Extract base query (everything before VALUES + "VALUES")
-	baseQuery := rSchema.insertRow[:valuesIdx+6]
+	// Extract base query (everything before the VALUES placeholder part)
+	baseQuery := formattedInsert[:lastParen]
+
+	// Extract the placeholder pattern - everything from last "(" to the end
+	placeholderPattern := formattedInsert[lastParen:]
+
+	// Count the number of placeholders in the pattern
+	// For PostgreSQL: count $1, $2, etc.
+	// For MySQL/ClickHouse: count ?
+	colCount := 0
+	if w.backend.opt.DBType == dbTypePostgres {
+		// Count $N patterns
+		for i := 1; strings.Contains(placeholderPattern, fmt.Sprintf("$%d", i)); i++ {
+			colCount = i
+		}
+	} else {
+		// Count ? placeholders
+		colCount = strings.Count(placeholderPattern, "?")
+	}
+
+	// If we couldn't determine from pattern, use the first row length
+	if colCount == 0 {
+		colCount = len(rows[0])
+	}
 
 	// Build the bulk insert query
 	var queryBuilder strings.Builder
@@ -242,21 +260,20 @@ func (w *SQLDBResultSet) WriteBatch(rows [][]interface{}) error {
 	// Collect all values
 	values := make([]interface{}, 0, len(rows)*colCount)
 
-	if isPostgres {
+	if w.backend.opt.DBType == dbTypePostgres {
 		// PostgreSQL: Build with numbered placeholders $1, $2, $3...
 		paramNum := 1
 		for i, row := range rows {
 			if i > 0 {
-				queryBuilder.WriteString(",")
+				queryBuilder.WriteString(", ")
 			}
-			queryBuilder.WriteString(" (")
+			queryBuilder.WriteString("(")
 			for j := 0; j < colCount; j++ {
 				if j > 0 {
-					queryBuilder.WriteString(", ")
+					queryBuilder.WriteString(",")
 				}
 				queryBuilder.WriteString(fmt.Sprintf("$%d", paramNum))
 				paramNum++
-
 				if j < len(row) {
 					values = append(values, row[j])
 				} else {
@@ -269,15 +286,14 @@ func (w *SQLDBResultSet) WriteBatch(rows [][]interface{}) error {
 		// MySQL/ClickHouse: Use ? placeholders
 		for i, row := range rows {
 			if i > 0 {
-				queryBuilder.WriteString(",")
+				queryBuilder.WriteString(", ")
 			}
-			queryBuilder.WriteString(" (")
+			queryBuilder.WriteString("(")
 			for j := 0; j < colCount; j++ {
 				if j > 0 {
-					queryBuilder.WriteString(", ")
+					queryBuilder.WriteString(",")
 				}
 				queryBuilder.WriteString("?")
-
 				if j < len(row) {
 					values = append(values, row[j])
 				} else {
@@ -288,10 +304,10 @@ func (w *SQLDBResultSet) WriteBatch(rows [][]interface{}) error {
 		}
 	}
 
-	// Execute the bulk insert
-	query := fmt.Sprintf(queryBuilder.String(), w.tbl)
-	_, err := w.tx.Exec(query, values...)
+	// The query is now complete
+	query := queryBuilder.String()
 
+	_, err := w.tx.Exec(query, values...)
 	if err != nil {
 		return fmt.Errorf("bulk insert failed: %v (query had %d values for %d rows of %d columns)",
 			err, len(values), len(rows), colCount)

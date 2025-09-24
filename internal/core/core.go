@@ -580,7 +580,7 @@ func (co *Core) writeResults(jobID string, task Task, ttl time.Duration, rows *s
 
 		// Write batch when full
 		if len(batch) >= batchSize {
-			if err := w.WriteBatch(batch); err != nil { // Need to implement WriteBatch
+			if err := w.WriteBatch(batch); err != nil {
 				return numRows, fmt.Errorf("error writing batch: %v", err)
 			}
 			batch = batch[:0] // Reset batch
