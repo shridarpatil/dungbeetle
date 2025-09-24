@@ -553,15 +553,45 @@ func (co *Core) writeResults(jobID string, task Task, ttl time.Duration, rows *s
 	}
 
 	// Scan each row and write to the results backend.
+	// for rows.Next() {
+	// 	if err := rows.Scan(resPointers...); err != nil {
+	// 		return numRows, err
+	// 	}
+	// 	if err := w.WriteRow(resCols); err != nil {
+	// 		return numRows, fmt.Errorf("error writing row to result backend: %v", err)
+	// 	}
+
+	// 	numRows++
+	// }
+
+	const batchSize = 1000 // Tune based on your data
+	batch := make([][]interface{}, 0, batchSize)
+
 	for rows.Next() {
 		if err := rows.Scan(resPointers...); err != nil {
 			return numRows, err
 		}
-		if err := w.WriteRow(resCols); err != nil {
-			return numRows, fmt.Errorf("error writing row to result backend: %v", err)
-		}
 
+		// Copy the row data
+		rowCopy := make([]interface{}, numCols)
+		copy(rowCopy, resCols)
+		batch = append(batch, rowCopy)
 		numRows++
+
+		// Write batch when full
+		if len(batch) >= batchSize {
+			if err := w.WriteBatch(batch); err != nil { // Need to implement WriteBatch
+				return numRows, fmt.Errorf("error writing batch: %v", err)
+			}
+			batch = batch[:0] // Reset batch
+		}
+	}
+
+	// Write remaining rows
+	if len(batch) > 0 {
+		if err := w.WriteBatch(batch); err != nil {
+			return numRows, err
+		}
 	}
 
 	if err := w.Flush(); err != nil {

@@ -17,6 +17,7 @@ type ResultSet interface {
 	IsColTypesRegistered() bool
 	WriteCols([]string) error
 	WriteRow([]interface{}) error
+	WriteBatch(rows [][]interface{}) error
 	Flush() error
 	Close() error
 }

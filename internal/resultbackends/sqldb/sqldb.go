@@ -206,6 +206,100 @@ func (w *SQLDBResultSet) WriteRow(row []interface{}) error {
 	return err
 }
 
+func (w *SQLDBResultSet) WriteBatch(rows [][]interface{}) error {
+	if len(rows) == 0 {
+		return nil
+	}
+
+	// Get the schema exactly like WriteRow does
+	w.backend.schemaMutex.RLock()
+	rSchema, ok := w.backend.resTableSchemas[w.taskName]
+	w.backend.schemaMutex.RUnlock()
+	if !ok {
+		return fmt.Errorf("column types for '%s' have not been registered", w.taskName)
+	}
+
+	// Determine column count from first row
+	colCount := len(rows[0])
+
+	// Check if PostgreSQL (uses numbered placeholders like $1, $2)
+	isPostgres := strings.Contains(rSchema.insertRow, "$")
+
+	// Find VALUES clause position
+	upperQuery := strings.ToUpper(rSchema.insertRow)
+	valuesIdx := strings.Index(upperQuery, "VALUES")
+	if valuesIdx == -1 {
+		return fmt.Errorf("cannot find VALUES in insert query")
+	}
+
+	// Extract base query (everything before VALUES + "VALUES")
+	baseQuery := rSchema.insertRow[:valuesIdx+6]
+
+	// Build the bulk insert query
+	var queryBuilder strings.Builder
+	queryBuilder.WriteString(baseQuery)
+
+	// Collect all values
+	values := make([]interface{}, 0, len(rows)*colCount)
+
+	if isPostgres {
+		// PostgreSQL: Build with numbered placeholders $1, $2, $3...
+		paramNum := 1
+		for i, row := range rows {
+			if i > 0 {
+				queryBuilder.WriteString(",")
+			}
+			queryBuilder.WriteString(" (")
+			for j := 0; j < colCount; j++ {
+				if j > 0 {
+					queryBuilder.WriteString(", ")
+				}
+				queryBuilder.WriteString(fmt.Sprintf("$%d", paramNum))
+				paramNum++
+
+				if j < len(row) {
+					values = append(values, row[j])
+				} else {
+					values = append(values, nil)
+				}
+			}
+			queryBuilder.WriteString(")")
+		}
+	} else {
+		// MySQL/ClickHouse: Use ? placeholders
+		for i, row := range rows {
+			if i > 0 {
+				queryBuilder.WriteString(",")
+			}
+			queryBuilder.WriteString(" (")
+			for j := 0; j < colCount; j++ {
+				if j > 0 {
+					queryBuilder.WriteString(", ")
+				}
+				queryBuilder.WriteString("?")
+
+				if j < len(row) {
+					values = append(values, row[j])
+				} else {
+					values = append(values, nil)
+				}
+			}
+			queryBuilder.WriteString(")")
+		}
+	}
+
+	// Execute the bulk insert
+	query := fmt.Sprintf(queryBuilder.String(), w.tbl)
+	_, err := w.tx.Exec(query, values...)
+
+	if err != nil {
+		return fmt.Errorf("bulk insert failed: %v (query had %d values for %d rows of %d columns)",
+			err, len(values), len(rows), colCount)
+	}
+
+	return nil
+}
+
 // Flush flushes the rows written into the sqlDB pipe.
 func (w *SQLDBResultSet) Flush() error {
 	err := w.tx.Commit()
