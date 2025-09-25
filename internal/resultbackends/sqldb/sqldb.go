@@ -269,48 +269,37 @@ func (w *SQLDBResultSet) insertBatch(batchRows [][]interface{}, rSchema insertSc
 
 	// Pre-allocate values slice with exact capacity
 	values := make([]interface{}, 0, len(batchRows)*rSchema.colCount)
+	placeHolder := "?"
+	paramNum := 1 // Track the overall parameter number for PostgreSQL
 
-	if w.backend.opt.DBType == dbTypePostgres {
-		paramNum := 1
-		for i, row := range batchRows {
-			if i > 0 {
-				queryBuilder.WriteString(",")
+	for i, row := range batchRows {
+		if i > 0 {
+			queryBuilder.WriteString(",")
+		}
+		queryBuilder.WriteString(" (")
+		for j := 0; j < rSchema.colCount; j++ {
+			if j > 0 {
+				queryBuilder.WriteString(", ")
 			}
-			queryBuilder.WriteString(" (")
-			for j := 0; j < rSchema.colCount; j++ {
-				if j > 0 {
-					queryBuilder.WriteString(", ")
-				}
-				queryBuilder.WriteString(fmt.Sprintf("$%d", paramNum))
+
+			// Generate the correct placeholder
+			if w.backend.opt.DBType == dbTypePostgres {
+				placeHolder = fmt.Sprintf("$%d", paramNum)
 				paramNum++
-				if j < len(row) {
-					values = append(values, row[j])
-				} else {
-					values = append(values, nil)
-				}
+			} else {
+				placeHolder = "?"
 			}
-			queryBuilder.WriteString(")")
+
+			queryBuilder.WriteString(placeHolder)
+
+			// Add the value
+			if j < len(row) {
+				values = append(values, row[j])
+			} else {
+				values = append(values, nil)
+			}
 		}
-	} else {
-		// MySQL/ClickHouse logic remains same but uses pooled builder
-		for i, row := range batchRows {
-			if i > 0 {
-				queryBuilder.WriteString(",")
-			}
-			queryBuilder.WriteString(" (")
-			for j := 0; j < rSchema.colCount; j++ {
-				if j > 0 {
-					queryBuilder.WriteString(", ")
-				}
-				queryBuilder.WriteString("?")
-				if j < len(row) {
-					values = append(values, row[j])
-				} else {
-					values = append(values, nil)
-				}
-			}
-			queryBuilder.WriteString(")")
-		}
+		queryBuilder.WriteString(")")
 	}
 
 	query := queryBuilder.String()
