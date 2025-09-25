@@ -48,10 +48,27 @@ type Core struct {
 	mu     sync.RWMutex
 
 	lo *slog.Logger
+
+	// pools for efficient row processing
+	pool *sync.Pool
+}
+
+type rowBuffer struct {
+	cols     []interface{}
+	pointers []interface{}
 }
 
 // New returns a new instance of Core.
 func New(o Opt, srcDBs dbpool.Pool, res ResultBackends, lo *slog.Logger) *Core {
+	var pool = sync.Pool{
+		New: func() interface{} {
+			// Pre-allocate slices for typical row sizes
+			return &rowBuffer{
+				cols:     make([]interface{}, 0, 100),
+				pointers: make([]interface{}, 0, 100),
+			}
+		},
+	}
 	return &Core{
 		opt:            o,
 		tasks:          make(Tasks),
@@ -60,6 +77,7 @@ func New(o Opt, srcDBs dbpool.Pool, res ResultBackends, lo *slog.Logger) *Core {
 		jobCtx:         make(map[string]context.CancelFunc),
 		mu:             sync.RWMutex{},
 		lo:             lo,
+		pool:           &pool,
 	}
 }
 
@@ -511,7 +529,7 @@ func (co *Core) execJob(jobID, taskName, dbName string, ttl time.Duration, args 
 func (co *Core) writeResults(jobID string, task Task, ttl time.Duration, rows *sql.Rows) (int64, error) {
 	var numRows int64
 
-	// Get the results backend.
+	// Get the columns in the results.
 	name, backend := task.ResultBackends.GetRandom()
 	co.lo.Info("sending results form", "job_id", jobID, "name", name)
 	w, err := backend.NewResultSet(jobID, task.Name, ttl)
@@ -520,7 +538,7 @@ func (co *Core) writeResults(jobID string, task Task, ttl time.Duration, rows *s
 	}
 	defer w.Close()
 
-	// Get the columns in the results.
+	// Get columns
 	cols, err := rows.Columns()
 	if err != nil {
 		return numRows, err
@@ -534,7 +552,6 @@ func (co *Core) writeResults(jobID string, task Task, ttl time.Duration, rows *s
 		if err != nil {
 			return numRows, err
 		}
-
 		w.RegisterColTypes(cols, colTypes)
 	}
 
@@ -543,54 +560,67 @@ func (co *Core) writeResults(jobID string, task Task, ttl time.Duration, rows *s
 		return numRows, fmt.Errorf("error writing columns to result backend: %v", err)
 	}
 
-	// Gymnastics to read arbitrary types from the row.
-	var (
-		resCols     = make([]interface{}, numCols)
-		resPointers = make([]interface{}, numCols)
-	)
-	for i := 0; i < numCols; i++ {
-		resPointers[i] = &resCols[i]
+	// Get buffer from pool
+	buf := co.pool.Get().(*rowBuffer)
+	defer func() {
+		// Reset and return to pool
+		buf.cols = buf.cols[:0]
+		buf.pointers = buf.pointers[:0]
+		co.pool.Put(buf)
+	}()
+
+	// Resize buffers if needed
+	if cap(buf.cols) < numCols {
+		buf.cols = make([]interface{}, numCols)
+		buf.pointers = make([]interface{}, numCols)
+	} else {
+		buf.cols = buf.cols[:numCols]
+		buf.pointers = buf.pointers[:numCols]
 	}
 
-	// Scan each row and write to the results backend.
-	// for rows.Next() {
-	// 	if err := rows.Scan(resPointers...); err != nil {
-	// 		return numRows, err
-	// 	}
-	// 	if err := w.WriteRow(resCols); err != nil {
-	// 		return numRows, fmt.Errorf("error writing row to result backend: %v", err)
-	// 	}
+	for i := 0; i < numCols; i++ {
+		buf.pointers[i] = &buf.cols[i]
+	}
 
-	// 	numRows++
-	// }
-
-	const batchSize = 1000 // Tune based on your data
-	batch := make([][]interface{}, 0, batchSize)
+	// Batch processing with pooled batch buffer
+	batchPool := getBatchPool()
+	batch := batchPool.Get().([][]interface{})
+	defer func() {
+		// Clear and return batch to pool
+		for i := range batch {
+			batch[i] = nil
+		}
+		batch = batch[:0]
+		batchPool.Put(batch)
+	}()
 
 	for rows.Next() {
-		if err := rows.Scan(resPointers...); err != nil {
+		if err := rows.Scan(buf.pointers...); err != nil {
 			return numRows, err
 		}
 
-		// Copy the row data
+		// Copy row data
 		rowCopy := make([]interface{}, numCols)
-		copy(rowCopy, resCols)
+		copy(rowCopy, buf.cols)
 		batch = append(batch, rowCopy)
 		numRows++
 
-		// Write batch when full
-		if len(batch) >= batchSize {
-			if err := w.WriteBatch(batch); err != nil {
+		if len(batch) >= 10000 {
+			if err := w.WriteRows(batch); err != nil {
 				return numRows, fmt.Errorf("error writing batch: %v", err)
 			}
-			batch = batch[:0] // Reset batch
+			// Clear batch
+			for i := range batch {
+				batch[i] = nil
+			}
+			batch = batch[:0]
 		}
 	}
 
 	// Write remaining rows
 	if len(batch) > 0 {
-		if err := w.WriteBatch(batch); err != nil {
-			return numRows, err
+		if err := w.WriteRows(batch); err != nil {
+			return numRows, fmt.Errorf("error writing final batch: %v", err)
 		}
 	}
 
@@ -599,6 +629,15 @@ func (co *Core) writeResults(jobID string, task Task, ttl time.Duration, rows *s
 	}
 
 	return numRows, nil
+}
+
+// Batch pool with size tiers
+func getBatchPool() *sync.Pool {
+	return &sync.Pool{
+		New: func() interface{} {
+			return make([][]interface{}, 0, 1000)
+		},
+	}
 }
 
 const (

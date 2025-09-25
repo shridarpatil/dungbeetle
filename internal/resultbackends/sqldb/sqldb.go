@@ -17,8 +17,9 @@ import (
 )
 
 const (
-	dbTypePostgres = "postgres"
-	dbTypeMysql    = "mysql"
+	dbTypePostgres   = "postgres"
+	dbTypeMysql      = "mysql"
+	dbTypeClickHouse = "clickhouse"
 )
 
 // Opt represents SQL DB backend's options.
@@ -48,7 +49,6 @@ type SQLDBResultSet struct {
 	taskName    string
 	colsWritten bool
 	cols        []string
-	rows        [][]byte
 	tx          *sql.Tx
 	tbl         string
 
@@ -61,6 +61,13 @@ type insertSchema struct {
 	dropTable   string
 	createTable string
 	insertRow   string
+	insertRows  string // Base query for batch inserts (without value placeholders)
+	colCount    int
+}
+
+type columnHolders struct {
+	names  []string
+	values []string
 }
 
 // NewSQLBackend returns a new sqlDB result backend instance.
@@ -206,7 +213,7 @@ func (w *SQLDBResultSet) WriteRow(row []interface{}) error {
 	return err
 }
 
-func (w *SQLDBResultSet) WriteBatch(rows [][]interface{}) error {
+func (w *SQLDBResultSet) WriteRows(rows [][]interface{}) error {
 	if len(rows) == 0 {
 		return nil
 	}
@@ -219,58 +226,60 @@ func (w *SQLDBResultSet) WriteBatch(rows [][]interface{}) error {
 		return fmt.Errorf("column types for '%s' have not been registered", w.taskName)
 	}
 
-	// First, format the insertRow with the table name
-	formattedInsert := fmt.Sprintf(rSchema.insertRow, w.tbl)
+	// Get optimal batch size based on database type and column count
+	batchSize := w.backend.GetOptimalBatchSize(rSchema.colCount)
 
-	// Find the last opening parenthesis which should be the VALUES clause
-	lastParen := strings.LastIndex(formattedInsert, "(")
-	if lastParen == -1 {
-		return fmt.Errorf("cannot find VALUES clause in insert query: %s", formattedInsert)
-	}
-
-	// Extract base query (everything before the VALUES placeholder part)
-	baseQuery := formattedInsert[:lastParen]
-
-	// Extract the placeholder pattern - everything from last "(" to the end
-	placeholderPattern := formattedInsert[lastParen:]
-
-	// Count the number of placeholders in the pattern
-	// For PostgreSQL: count $1, $2, etc.
-	// For MySQL/ClickHouse: count ?
-	colCount := 0
-	if w.backend.opt.DBType == dbTypePostgres {
-		// Count $N patterns
-		for i := 1; strings.Contains(placeholderPattern, fmt.Sprintf("$%d", i)); i++ {
-			colCount = i
+	// Process rows in batches
+	for start := 0; start < len(rows); start += batchSize {
+		end := start + batchSize
+		if end > len(rows) {
+			end = len(rows)
 		}
-	} else {
-		// Count ? placeholders
-		colCount = strings.Count(placeholderPattern, "?")
+
+		if err := w.insertBatch(rows[start:end], rSchema); err != nil {
+			return fmt.Errorf("batch %d-%d failed: %w", start, end, err)
+		}
 	}
 
-	// If we couldn't determine from pattern, use the first row length
-	if colCount == 0 {
-		colCount = len(rows[0])
-	}
+	return nil
+}
 
-	// Build the bulk insert query
-	var queryBuilder strings.Builder
+var stringBuilderPool = sync.Pool{
+	New: func() interface{} {
+		return &strings.Builder{}
+	},
+}
+
+// Modified insertBatch function
+func (w *SQLDBResultSet) insertBatch(batchRows [][]interface{}, rSchema insertSchema) error {
+	baseQuery := fmt.Sprintf(rSchema.insertRows, w.tbl)
+
+	// Get builder from pool
+	queryBuilder := stringBuilderPool.Get().(*strings.Builder)
+	defer func() {
+		queryBuilder.Reset()
+		stringBuilderPool.Put(queryBuilder)
+	}()
+
+	// Pre-allocate capacity
+	estimatedSize := len(baseQuery) + (len(batchRows) * rSchema.colCount * 10)
+	queryBuilder.Grow(estimatedSize)
+
 	queryBuilder.WriteString(baseQuery)
 
-	// Collect all values
-	values := make([]interface{}, 0, len(rows)*colCount)
+	// Pre-allocate values slice with exact capacity
+	values := make([]interface{}, 0, len(batchRows)*rSchema.colCount)
 
 	if w.backend.opt.DBType == dbTypePostgres {
-		// PostgreSQL: Build with numbered placeholders $1, $2, $3...
 		paramNum := 1
-		for i, row := range rows {
+		for i, row := range batchRows {
 			if i > 0 {
-				queryBuilder.WriteString(", ")
+				queryBuilder.WriteString(",")
 			}
-			queryBuilder.WriteString("(")
-			for j := 0; j < colCount; j++ {
+			queryBuilder.WriteString(" (")
+			for j := 0; j < rSchema.colCount; j++ {
 				if j > 0 {
-					queryBuilder.WriteString(",")
+					queryBuilder.WriteString(", ")
 				}
 				queryBuilder.WriteString(fmt.Sprintf("$%d", paramNum))
 				paramNum++
@@ -283,15 +292,15 @@ func (w *SQLDBResultSet) WriteBatch(rows [][]interface{}) error {
 			queryBuilder.WriteString(")")
 		}
 	} else {
-		// MySQL/ClickHouse: Use ? placeholders
-		for i, row := range rows {
+		// MySQL/ClickHouse logic remains same but uses pooled builder
+		for i, row := range batchRows {
 			if i > 0 {
-				queryBuilder.WriteString(", ")
+				queryBuilder.WriteString(",")
 			}
-			queryBuilder.WriteString("(")
-			for j := 0; j < colCount; j++ {
+			queryBuilder.WriteString(" (")
+			for j := 0; j < rSchema.colCount; j++ {
 				if j > 0 {
-					queryBuilder.WriteString(",")
+					queryBuilder.WriteString(", ")
 				}
 				queryBuilder.WriteString("?")
 				if j < len(row) {
@@ -304,13 +313,12 @@ func (w *SQLDBResultSet) WriteBatch(rows [][]interface{}) error {
 		}
 	}
 
-	// The query is now complete
 	query := queryBuilder.String()
 
 	_, err := w.tx.Exec(query, values...)
 	if err != nil {
-		return fmt.Errorf("bulk insert failed: %v (query had %d values for %d rows of %d columns)",
-			err, len(values), len(rows), colCount)
+		return fmt.Errorf("exec failed: %v (had %d values for %d rows of %d columns)",
+			err, len(values), len(batchRows), rSchema.colCount)
 	}
 
 	return nil
@@ -338,23 +346,48 @@ func (w *SQLDBResultSet) Close() error {
 // createTableSchema takes an SQL query results, gets its column names and types,
 // and generates a sqlDB CREATE TABLE() schema for the results.
 func (s *SqlDB) createTableSchema(cols []string, colTypes []*sql.ColumnType) insertSchema {
-	var (
-		colNameHolder = make([]string, len(cols))
-		colValHolder  = make([]string, len(cols))
-	)
+	// Pool for column holders used in schema creation
+	var colHolderPool = sync.Pool{
+		New: func() interface{} {
+			return &columnHolders{
+				names:  make([]string, 0, 50),
+				values: make([]string, 0, 50),
+			}
+		},
+	}
+	holders := colHolderPool.Get().(*columnHolders)
 
+	// Resize if needed
+	if cap(holders.names) < len(cols) {
+		holders.names = make([]string, len(cols))
+		holders.values = make([]string, len(cols))
+	} else {
+		holders.names = holders.names[:len(cols)]
+		holders.values = holders.values[:len(cols)]
+	}
+
+	// Build column name holders and value placeholders
 	for i := range cols {
-		colNameHolder[i] = s.quoteIdentifier(cols[i])
-
-		// This will be filled by the driver.
+		holders.names[i] = s.quoteIdentifier(cols[i])
 		if s.opt.DBType == dbTypePostgres {
-			// Postgres placeholders are $1, $2 ...
-			colValHolder[i] = fmt.Sprintf("$%d", i+1)
+			holders.values[i] = fmt.Sprintf("$%d", i+1)
 		} else {
-			colValHolder[i] = "?"
+			holders.values[i] = "?"
 		}
 	}
 
+	// Copy to local variables before returning to pool
+	colNameHolder := make([]string, len(holders.names))
+	colValHolder := make([]string, len(holders.values))
+	copy(colNameHolder, holders.names)
+	copy(colValHolder, holders.values)
+
+	// Return to pool early
+	holders.names = holders.names[:0]
+	holders.values = holders.values[:0]
+	colHolderPool.Put(holders)
+
+	// Continue with the rest of the function using local copies
 	var (
 		fields   = make([]string, len(cols))
 		typ      string
@@ -397,20 +430,89 @@ func (s *SqlDB) createTableSchema(cols []string, colTypes []*sql.ColumnType) ins
 		fields[i] = fmt.Sprintf("%s %s", s.quoteIdentifier(cols[i]), typ)
 	}
 
-	// If the DB is Postgres, optionally create an "unlogged" table that disables
-	// WAL, improving performance of throw-away cache tables.
-	// https://www.postgresql.org/docs/current/sql-createtable.html
 	if s.opt.DBType == dbTypePostgres && s.opt.UnloggedTables {
 		unlogged = "UNLOGGED"
 	}
 
+	baseInsert := fmt.Sprintf("INSERT INTO %s (%s) VALUES",
+		s.quoteIdentifier("%s"),
+		strings.Join(colNameHolder, ","))
+
 	return insertSchema{
-		dropTable:   fmt.Sprintf("DROP TABLE IF EXISTS %s;", s.quoteIdentifier("%s")),
-		createTable: fmt.Sprintf("CREATE %s TABLE IF NOT EXISTS %s (%s);", unlogged, s.quoteIdentifier("%s"), strings.Join(fields, ",")),
+		dropTable: fmt.Sprintf("DROP TABLE IF EXISTS %s;", s.quoteIdentifier("%s")),
+		createTable: fmt.Sprintf("CREATE %s TABLE IF NOT EXISTS %s (%s);",
+			unlogged,
+			s.quoteIdentifier("%s"),
+			strings.Join(fields, ",")),
 		insertRow: fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)",
 			s.quoteIdentifier("%s"),
 			strings.Join(colNameHolder, ","),
 			strings.Join(colValHolder, ",")),
+		insertRows: baseInsert,
+		colCount:   len(cols),
+	}
+}
+
+func (s *SqlDB) GetOptimalBatchSize(columnCount int) int {
+	switch s.opt.DBType {
+	case dbTypePostgres:
+		const (
+			pgMaxParams = 65535
+			pgOptimal   = 3000
+			pgMax       = 10000
+		)
+
+		maxPossible := (pgMaxParams - 100) / columnCount
+
+		// For financial data with many columns (contract_note_items)
+		if columnCount > 50 {
+			maxPossible = maxPossible / 2 // Be conservative
+		}
+
+		switch {
+		case maxPossible < 100:
+			return 100
+		case maxPossible < pgOptimal:
+			return maxPossible
+		case maxPossible > pgMax:
+			return pgMax
+		default:
+			return pgOptimal
+		}
+
+	case dbTypeMysql:
+		const (
+			mysqlOptimal = 1000
+			mysqlMax     = 5000
+			mysqlParams  = 65535
+		)
+
+		maxPossible := mysqlParams / columnCount
+
+		// Consider max_allowed_packet
+		if columnCount > 100 {
+			return 500 // Conservative for wide tables
+		}
+
+		if maxPossible < mysqlOptimal {
+			return maxPossible
+		} else if maxPossible > mysqlMax {
+			return mysqlMax
+		}
+		return mysqlOptimal
+
+	case dbTypeClickHouse:
+		// ClickHouse can handle massive batches
+		if columnCount > 100 {
+			return 10000
+		} else if columnCount > 50 {
+			return 25000
+		}
+		return 50000
+
+	default:
+		// Conservative default
+		return 500
 	}
 }
 
