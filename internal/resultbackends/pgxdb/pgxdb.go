@@ -22,7 +22,7 @@ type Opt struct {
 	ResultsTable    string
 	UnloggedTables  bool
 	BatchInsert     bool // Enable bulk inserts
-	BatchSize       int  // Batch size for COPY operations
+	BatchSize       int  // Batch size for bulk operations
 	MaxConns        int
 	MaxConnIdleTime int
 }
@@ -46,7 +46,7 @@ type PgxResultSet struct {
 	cols        []string
 	colTypes    []*sql.ColumnType
 
-	// For COPY protocol
+	// For batch processing
 	rows      [][]interface{}
 	rowBuffer sync.Pool
 
@@ -211,20 +211,19 @@ func (w *PgxResultSet) WriteRow(row []interface{}) error {
 	}
 
 	if w.backend.opt.BatchInsert {
-		// Buffer rows for COPY protocol
+		// Buffer rows for batch processing.
 		rowCopy := make([]interface{}, len(row))
 		copy(rowCopy, row)
 		w.rows = append(w.rows, rowCopy)
 
 		// Flush if we've reached batch size
 		if len(w.rows) >= w.backend.opt.BatchSize {
-			fmt.Println("Flushing batch of rows using COPY protocol	", len(w.rows))
-			return w.flushCopy()
+			return w.flushBatch()
 		}
 		return nil
 	}
 
-	// Standard insert for non-COPY mode
+	// Standard insert for non-batch mode
 	w.backend.schemaMutex.RLock()
 	rSchema, ok := w.backend.resTableSchemas[w.taskName]
 	w.backend.schemaMutex.RUnlock()
@@ -237,8 +236,8 @@ func (w *PgxResultSet) WriteRow(row []interface{}) error {
 	return err
 }
 
-// flushCopy performs bulk insert using COPY protocol.
-func (w *PgxResultSet) flushCopy() error {
+// flushBatch performs bulk insert using batch process.
+func (w *PgxResultSet) flushBatch() error {
 	if len(w.rows) == 0 {
 		return nil
 	}
@@ -251,7 +250,7 @@ func (w *PgxResultSet) flushCopy() error {
 		return fmt.Errorf("schema not found for task '%s'", w.taskName)
 	}
 
-	// Use COPY protocol for bulk insert
+	// Use batch process for bulk insert
 	conn, err := w.backend.pool.Acquire(w.ctx)
 	if err != nil {
 		return fmt.Errorf("failed to acquire connection: %w", err)
@@ -281,9 +280,9 @@ func (w *PgxResultSet) flushCopy() error {
 
 // Flush flushes any buffered rows and commits the transaction.
 func (w *PgxResultSet) Flush() error {
-	// Flush any remaining buffered rows if using COPY
+	// Flush any remaining buffered rows if using batch inserts
 	if w.backend.opt.BatchInsert && len(w.rows) > 0 {
-		if err := w.flushCopy(); err != nil {
+		if err := w.flushBatch(); err != nil {
 			return err
 		}
 	}
@@ -320,7 +319,7 @@ func (p *PgxDB) createTableSchema(cols []string, colTypes []*sql.ColumnType) ins
 		quotedCol := fmt.Sprintf(`"%s"`, col)
 		colNameHolder[i] = quotedCol
 		colValHolder[i] = fmt.Sprintf("$%d", i+1)
-		copyColumns[i] = col // Unquoted for COPY
+		copyColumns[i] = col // Unquoted for batch inserts
 
 		// Map SQL types to PostgreSQL types
 		typ := mapColumnType(colTypes[i])
