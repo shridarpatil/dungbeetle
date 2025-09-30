@@ -29,11 +29,9 @@ type Opt struct {
 
 // PgxDB represents the optimized PostgreSQL backend.
 type PgxDB struct {
-	pool   *pgxpool.Pool
-	opt    Opt
-	logger *slog.Logger
-
-	// Cache for result schemas
+	pool            *pgxpool.Pool
+	opt             Opt
+	logger          *slog.Logger
 	resTableSchemas map[string]insertSchema
 	schemaMutex     sync.RWMutex
 }
@@ -76,7 +74,6 @@ func NewPgxBackend(connString string, opt Opt, lo *slog.Logger) (*PgxDB, error) 
 	if opt.MaxConns == 0 {
 		opt.MaxConns = 5
 	}
-	// Optimize connection pool settings
 	config.MaxConns = int32(opt.MaxConns)
 	config.MinConns = 5
 	config.MaxConnLifetime = time.Hour
@@ -100,7 +97,7 @@ func NewPgxBackend(connString string, opt Opt, lo *slog.Logger) (*PgxDB, error) 
 		logger:          lo,
 	}
 
-	if opt.BatchSize == 0 {
+	if s.opt.BatchSize == 0 {
 		s.opt.BatchSize = 5000
 	}
 
@@ -148,7 +145,6 @@ func (w *PgxResultSet) RegisterColTypes(cols []string, colTypes []*sql.ColumnTyp
 	copy(w.cols, cols)
 	w.colTypes = colTypes
 
-	// Create schema and cache it
 	w.backend.schemaMutex.Lock()
 	w.backend.resTableSchemas[w.taskName] = w.backend.createTableSchema(cols, colTypes)
 	w.backend.schemaMutex.Unlock()
@@ -173,7 +169,6 @@ func (w *PgxResultSet) WriteCols(cols []string) error {
 	w.backend.schemaMutex.RLock()
 	rSchema, ok := w.backend.resTableSchemas[w.taskName]
 	w.backend.schemaMutex.RUnlock()
-
 	if !ok {
 		return fmt.Errorf("column types for '%s' have not been registered", w.taskName)
 	}
@@ -227,7 +222,6 @@ func (w *PgxResultSet) WriteRow(row []interface{}) error {
 	w.backend.schemaMutex.RLock()
 	rSchema, ok := w.backend.resTableSchemas[w.taskName]
 	w.backend.schemaMutex.RUnlock()
-
 	if !ok {
 		return fmt.Errorf("schema not found for task '%s'", w.taskName)
 	}
@@ -245,7 +239,6 @@ func (w *PgxResultSet) flushBatch() error {
 	w.backend.schemaMutex.RLock()
 	rSchema, ok := w.backend.resTableSchemas[w.taskName]
 	w.backend.schemaMutex.RUnlock()
-
 	if !ok {
 		return fmt.Errorf("schema not found for task '%s'", w.taskName)
 	}
@@ -263,7 +256,6 @@ func (w *PgxResultSet) flushBatch() error {
 		rSchema.copyColumns,
 		pgx.CopyFromRows(w.rows),
 	)
-
 	if err != nil {
 		return fmt.Errorf("COPY failed: %w", err)
 	}
@@ -308,12 +300,10 @@ func (w *PgxResultSet) Close() error {
 
 // createTableSchema generates SQL schemas for table operations.
 func (p *PgxDB) createTableSchema(cols []string, colTypes []*sql.ColumnType) insertSchema {
-	var (
-		colNameHolder = make([]string, len(cols))
-		colValHolder  = make([]string, len(cols))
-		copyColumns   = make([]string, len(cols))
-		fields        = make([]string, len(cols))
-	)
+	colNameHolder := make([]string, len(cols))
+	colValHolder := make([]string, len(cols))
+	copyColumns := make([]string, len(cols))
+	fields := make([]string, len(cols))
 
 	for i, col := range cols {
 		quotedCol := fmt.Sprintf(`"%s"`, col)
@@ -328,7 +318,6 @@ func (p *PgxDB) createTableSchema(cols []string, colTypes []*sql.ColumnType) ins
 		if nullable, ok := colTypes[i].Nullable(); ok && !nullable {
 			typ += " NOT NULL"
 		}
-
 		fields[i] = fmt.Sprintf("%s %s", quotedCol, typ)
 	}
 
@@ -339,7 +328,7 @@ func (p *PgxDB) createTableSchema(cols []string, colTypes []*sql.ColumnType) ins
 	}
 
 	return insertSchema{
-		dropTable: `DROP TABLE IF EXISTS "%s" CASCADE`,
+		dropTable: fmt.Sprintf(`DROP TABLE IF EXISTS "%%s" CASCADE`),
 		createTable: fmt.Sprintf(`CREATE %s TABLE IF NOT EXISTS "%%s" (%s)`,
 			unlogged, strings.Join(fields, ", ")),
 		insertRow: fmt.Sprintf(`INSERT INTO "%%s" (%s) VALUES (%s)`,

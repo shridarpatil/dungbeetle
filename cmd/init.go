@@ -271,6 +271,7 @@ func createPgxResultBackend(name string, config dbpool.Config, ko *koanf.Koanf, 
 		ResultsTable:    ko.MustString(fmt.Sprintf("results.%s.results_table", name)),
 		UnloggedTables:  config.Unlogged,
 		BatchInsert:     config.BatchInsert,
+		BatchSize:       config.BatchSize,
 		MaxConns:        config.MaxActiveConns,
 		MaxConnIdleTime: config.MaxIdleConns,
 	}
