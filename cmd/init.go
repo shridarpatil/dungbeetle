@@ -237,20 +237,9 @@ func initResultBackends(resDBs map[string]dbpool.Config, ko *koanf.Koanf, logger
 		var backend models.ResultBackend
 		var err error
 
-		// Check if we should use optimized pgx backend for PostgreSQL
+		// Use pgx backend for PostgreSQL.
 		if config.Type == "postgres" {
 			backend, err = createPgxResultBackend(name, config, ko, logger)
-			if err != nil {
-				// Fall back to standard SQL backend on error
-				logger.Warn("failed to create pgx backend, falling back to standard SQL",
-					"name", name, "error", err)
-
-				return nil, fmt.Errorf("error initializing result backend '%s': %w", name, err)
-			} else {
-				logger.Info("using optimized pgx backend",
-					"name", name,
-				)
-			}
 		} else {
 			// Use standard SQL backend for other databases
 			backend, err = createSQLResultBackend(name, config, ko, logger)
