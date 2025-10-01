@@ -342,21 +342,49 @@ func (p *PgxDB) createTableSchema(cols []string, colTypes []*sql.ColumnType) ins
 func mapColumnType(colType *sql.ColumnType) string {
 	typeName := colType.DatabaseTypeName()
 
+	// Remove Nullable wrapper if present (ClickHouse specific)
+	if strings.HasPrefix(typeName, "Nullable(") && strings.HasSuffix(typeName, ")") {
+		typeName = strings.TrimPrefix(typeName, "Nullable(")
+		typeName = strings.TrimSuffix(typeName, ")")
+	}
+
 	switch strings.ToUpper(typeName) {
+	// PostgreSQL native types
 	case "INT2", "INT4", "INT8", "TINYINT", "SMALLINT", "INT", "MEDIUMINT", "BIGINT":
 		return "BIGINT"
-	case "FLOAT4", "FLOAT8", "DECIMAL", "FLOAT", "DOUBLE", "NUMERIC", "FLOAT32", "FLOAT64":
+
+	// ClickHouse integer types
+	case "UINT8", "UINT16", "UINT32", "UINT64", "INT16", "INT32", "INT64":
+		return "BIGINT"
+
+	// Float types
+	case "FLOAT4", "FLOAT8", "DECIMAL", "FLOAT", "DOUBLE", "NUMERIC":
 		return "DECIMAL"
-	case "TIMESTAMP", "DATETIME":
+
+	// ClickHouse float types
+	case "FLOAT32", "FLOAT64":
+		return "DECIMAL"
+
+	// String types
+	case "STRING", "FIXEDSTRING":
+		return "TEXT"
+
+	// Date/Time types
+	case "TIMESTAMP", "DATETIME", "DATETIME64":
 		return "TIMESTAMP"
-	case "DATE":
+	case "DATE", "DATE32":
 		return "DATE"
-	case "BOOLEAN":
+
+	// Other types
+	case "BOOLEAN", "BOOL":
 		return "BOOLEAN"
 	case "JSON", "JSONB":
 		return "JSONB"
 	case "VARCHAR":
 		return "VARCHAR(255)"
+	case "TEXT":
+		return "TEXT"
+
 	default:
 		return "TEXT"
 	}
